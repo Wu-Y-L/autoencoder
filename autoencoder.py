@@ -42,14 +42,19 @@ class MultiheadSelfAttention(nn.Module):
             q = q + pos
             k = k + pos
 
-        # scale dot product
+        # memory-efficient attention: scaled_dot_product_attention uses a fused/flash
+        # kernel and never materializes the (B, heads, N, N) matrix, which is the
+        # O(N^2) memory blow-up at the 64x64 bottleneck (N = 4096).
+        # SDPA expects (B, heads, seq, head_dims), so transpose the last two dims.
+        q = q.transpose(-2, -1)
+        k = k.transpose(-2, -1)
+        v = v.transpose(-2, -1)
 
-        attn = torch.einsum("b h d n, b h d m -> b h n m", q, k) * self.scale
-        attn = attn.softmax(dim=-1)
+        # default scale is 1/sqrt(head_dims), matching self.scale
+        out = nn.functional.scaled_dot_product_attention(q, k, v)
 
-        # apply to values
-        out = torch.einsum("b h n m , b h d m -> b h d n", attn, v)
-        out = out.reshape(B, C, H, W)
+        # back to (B, heads, head_dims, N) -> (B, C, H, W)
+        out = out.transpose(-2, -1).reshape(B, C, H, W)
 
         return self.proj(out) + x
 
@@ -279,17 +284,17 @@ class VAE(nn.Module):
 
             skip_idx = len(reverse_channel) - 2 - i
 
-            skip_c = channel_list[
-                skip_idx
-            ]  # assume channel_list (3,32,64,128,256). reverse = (256,128,64,32,3).
+            # skip connections removed for latent diffusion: the decoder must
+            # reconstruct from z alone, since no encoder activations are available
+            # at sampling time. Using the skip-free block instead of upsample_block.
+            # skip_c = channel_list[skip_idx]
             use_attn = attn_flag[skip_idx - 1]
             self.decode_block.append(
-                upsample_block(
+                upsample_block_no_skip(
                     in_c,
                     out_c,
-                    skip_channel=skip_c,
-                    use_attn=use_attn,
                     groups=groups,
+                    use_attn=use_attn,
                     silu=silu,
                     int_res=int_res,
                 )
@@ -313,39 +318,36 @@ class VAE(nn.Module):
         )
 
     def encode(self, x):
-        skips = []
+        # skips = []  # skip connections removed for latent diffusion
         for block in self.enc_block:
             x = block(x)
 
             # store skip connections
-            skips.append(x)
+            # skips.append(x)
 
         mu = self.conv_mu(x)
         log_var = self.conv_log_var(x)
 
-        return skips, mu, log_var
+        return mu, log_var
 
     def reparameterization(self, mu, log_var):
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
         return mu + std * eps
 
-    def decode(self, z, skips):
+    def decode(self, z):
         # we write latent space representation as p(z)
         x = self.dec_initial(z)
-        # use all except last one
-        skips_for_decoder = list(reversed(skips[:-1]))
+        # skip connections removed for latent diffusion: every block is skip-free
+        # skips_for_decoder = list(reversed(skips[:-1]))
 
-        for i, block in enumerate(self.decode_block):
-            if i < len(skips_for_decoder):
-                x = block(x, skips_for_decoder[i])
-            else:
-                x = block(x)  # no skip connection
+        for block in self.decode_block:
+            x = block(x)  # no skip connection
 
         return self.final_conv(x)
 
     def forward(self, x):
-        skip, mu, log_var = self.encode(x)
+        mu, log_var = self.encode(x)
         z = self.reparameterization(mu, log_var)
-        reconstruct = self.decode(z, skip)
+        reconstruct = self.decode(z)
         return reconstruct, mu, log_var
