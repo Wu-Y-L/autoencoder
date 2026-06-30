@@ -46,9 +46,9 @@ class MultiheadSelfAttention(nn.Module):
         # kernel and never materializes the (B, heads, N, N) matrix, which is the
         # O(N^2) memory blow-up at the 64x64 bottleneck (N = 4096).
         # SDPA expects (B, heads, seq, head_dims), so transpose the last two dims.
-        q = q.transpose(-2, -1)
-        k = k.transpose(-2, -1)
-        v = v.transpose(-2, -1)
+        q = q.transpose(-2, -1).contiguous()
+        k = k.transpose(-2, -1).contiguous()
+        v = v.transpose(-2, -1).contiguous()
 
         # default scale is 1/sqrt(head_dims), matching self.scale
         out = nn.functional.scaled_dot_product_attention(q, k, v)
