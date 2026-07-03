@@ -75,7 +75,16 @@ discriminator = loss.snPATCH_discriminator(in_channel=1, base_ch=64, n_layers=3)
 torchinfo.summary(vae, input_size=(BATCH_SIZE, 1, PATCH_SIZE, PATCH_SIZE))
 torchinfo.summary(discriminator, input_size=(BATCH_SIZE, 1, PATCH_SIZE, PATCH_SIZE))
 
-loss_fn = loss.VAE_loss(l1_w=1.0, kl_w=1.0, adv_w=0.5, adv_start_step=10000)
+steps_per_epoch = len(train_dataloader)
+total_steps = steps_per_epoch * EPOCHS
+
+loss_fn = loss.VAE_loss(
+    l1_w=1.0,
+    kl_w=1.0,
+    adv_w=0.5,
+    adv_start_step=int(0.05 * total_steps),
+    adv_ramp_steps=int(0.10 * total_steps),
+)
 
 vae_opt = torch.optim.AdamW(
     vae.parameters(),
@@ -92,9 +101,6 @@ disc_opt = torch.optim.AdamW(
     weight_decay=9.38e-06,
     eps=9.69e-09,
 )
-
-steps_per_epoch = len(train_dataloader)
-total_steps = steps_per_epoch * EPOCHS
 
 kl_start = int(0.05 * total_steps)
 kl_end = int(0.40 * total_steps)
