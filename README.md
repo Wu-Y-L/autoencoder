@@ -5,3 +5,5 @@
 - Targeted for microscopy, but should work for anything. Maybe for something else add image quality metrics in, but I personally don't like them for microscopy. Training generative adversarial style. Loss has reconstruction loss ( l1 ), KL divergence, and discriminator loss.
 
 removed skipped residuals 
+
+wasn't very training very well with dimmer foregrounds, added masked adversarial network to see if it works.
