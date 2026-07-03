@@ -1,4 +1,5 @@
 # add KL annealing scheduler
+import copy
 import math
 import loss
 import torch
@@ -39,6 +40,8 @@ def train_step(
     step,
     device,
     scaler,
+    ema_vae=None,
+    ema_decay=0.999,
 ):
 
     total_disc_loss, total_vae_loss = 0.0, 0.0
@@ -52,22 +55,24 @@ def train_step(
         with torch.autocast(device_type=device):
             reconstruct, mu, log_var = vae(X)
 
-        # train discriminator
-        disc_opt.zero_grad()
+        # train discriminator (gated: prevents over-specialization before gen feels adv)
+        disc_loss = torch.tensor(0.0, device=device)
+        if step >= loss_fn.adv_start_step:
+            disc_opt.zero_grad()
 
-        disc_recon = reconstruct.detach()
+            disc_recon = reconstruct.detach()
 
-        with torch.autocast(device_type=device):
-            fake_score = discriminator(disc_recon)
-            real_score = discriminator(X)
+            with torch.autocast(device_type=device):
+                fake_score = discriminator(disc_recon)
+                real_score = discriminator(X)
 
-            loss_real, loss_fake = loss.hinge_discriminator(real_score, fake_score)
-            disc_loss = loss_real + loss_fake
+                loss_real, loss_fake = loss.hinge_discriminator(
+                    real_score, fake_score
+                )
+                disc_loss = loss_real + loss_fake
 
-        scaler.scale(disc_loss).backward()
-        scaler.step(disc_opt)
-
-        # disc_opt.step()
+            scaler.scale(disc_loss).backward()
+            scaler.step(disc_opt)
 
         # train vae
         vae_opt.zero_grad()
@@ -109,6 +114,11 @@ def train_step(
 
         scaler.update()
 
+        if ema_vae is not None:
+            with torch.no_grad():
+                for ema_p, p in zip(ema_vae.parameters(), vae.parameters()):
+                    ema_p.mul_(ema_decay).add_(p, alpha=1 - ema_decay)
+
     return avg_vae_loss, avg_disc_loss, step
 
 
@@ -149,6 +159,46 @@ def test_step(vae, discriminator, test_dataloader, loss_fn, kl_scheduler, step, 
             total_disc_loss += disc_loss.cpu().item()
             total_vae_loss += vae_loss.cpu().item()
 
+            with torch.no_grad():
+                p5 = torch.quantile(
+                    X.view(X.size(0), -1), 0.05, dim=1
+                ).view(-1, 1, 1, 1)
+                p10 = torch.quantile(
+                    X.view(X.size(0), -1), 0.10, dim=1
+                ).view(-1, 1, 1, 1)
+
+                p10_target = torch.quantile(
+                    X.view(X.size(0), -1), 0.10, dim=1
+                )
+                p10_recon = torch.quantile(
+                    reconstruct.view(reconstruct.size(0), -1), 0.10, dim=1
+                )
+                loss_dict["dim_preservation_ratio"] = (
+                    p10_recon / (p10_target + 1e-8)
+                ).mean()
+
+                bg_mask = (X <= p5).float()
+                bg_recon_var = ((reconstruct * bg_mask) ** 2).sum() / (
+                    bg_mask.sum() + 1e-8
+                )
+                bg_target_var = ((X * bg_mask) ** 2).sum() / (
+                    bg_mask.sum() + 1e-8
+                )
+                loss_dict["bg_hallucination_ratio"] = bg_recon_var / (
+                    bg_target_var + 1e-8
+                )
+
+                bottom_mask = (X <= p10).float()
+                recon_bottom = (
+                    reconstruct.abs() * bottom_mask
+                ).sum() / (bottom_mask.sum() + 1e-8)
+                target_bottom = (X.abs() * bottom_mask).sum() / (
+                    bottom_mask.sum() + 1e-8
+                )
+                loss_dict["deletion_ratio"] = recon_bottom / (
+                    target_bottom + 1e-8
+                )
+
             if i % 100 == 0:
                 print(
                     f"test step currently at : {i} / {len(test_dataloader)} \n"
@@ -174,6 +224,7 @@ def train_vae(
     model_name,
     kl_annealing_scheduler,
     device,
+    ema_decay=0.999,
 ):
 
     # implement caching here
@@ -244,6 +295,18 @@ def train_vae(
     ):
         scaler.load_state_dict(checkpoint_states["scaler_state_dict"])
 
+    # EMA copy of VAE weights for stable test-time metrics and previews
+    ema_vae = copy.deepcopy(vae)
+    ema_vae.eval()
+    for p in ema_vae.parameters():
+        p.requires_grad_(False)
+
+    if (
+        model_checkpoint_path.exists()
+        and checkpoint_states.get("ema_vae_state_dict") is not None
+    ):
+        ema_vae.load_state_dict(checkpoint_states["ema_vae_state_dict"])
+
     # training loop
     with alive_bar(epochs - checkpoint_epoch, bar="fish") as bar:
         for epoch in range(checkpoint_epoch, epochs):
@@ -258,29 +321,42 @@ def train_vae(
                 step=global_step,
                 device=device,
                 scaler=scaler,
+                ema_vae=ema_vae,
+                ema_decay=ema_decay,
             )
 
             # generate a few preview images on test set
 
             with torch.inference_mode():
-                plt.figure(figsize=(16, 8))
+                plt.figure(figsize=(16, 12))
 
-                vae.eval()
+                ema_vae.eval()
                 x = next(iter(test_dataloader)).to(device)
-                gen_img, _, _ = vae(x)
+                gen_img, _, _ = ema_vae(x)
+
+                # latent space generation: sample z ~ N(0,1) and decode
+                mu, log_var = ema_vae.encode(x)
+                z_sampled = torch.randn_like(mu)
+                latent_gen = ema_vae.decode(z_sampled)
 
                 for i in range(4):
                     orig = x[i].cpu().permute(1, 2, 0).squeeze()
                     recon = gen_img[i].cpu().permute(1, 2, 0).squeeze()
+                    lat = latent_gen[i].cpu().permute(1, 2, 0).squeeze()
 
-                    plt.subplot(4, 2, i * 2 + 1)
+                    plt.subplot(4, 3, i * 3 + 1)
                     plt.imshow(recon)
-                    plt.title("generated by vae")
+                    plt.title("vae reconstruction")
                     plt.axis("off")
 
-                    plt.subplot(4, 2, i * 2 + 2)
+                    plt.subplot(4, 3, i * 3 + 2)
                     plt.imshow(orig)
                     plt.title("input img")
+                    plt.axis("off")
+
+                    plt.subplot(4, 3, i * 3 + 3)
+                    plt.imshow(lat)
+                    plt.title("latent sampled")
                     plt.axis("off")
 
                 plt.show(block=False)
@@ -288,7 +364,7 @@ def train_vae(
                 plt.close("all")
 
             test_vae_loss, test_disc_loss = test_step(
-                vae=vae,
+                vae=ema_vae,
                 discriminator=discriminator,
                 test_dataloader=test_dataloader,
                 loss_fn=vae_loss,
@@ -317,21 +393,22 @@ def train_vae(
 
             # checkpointing
 
-            checkpoint_states = {
-                "vae_state_dict": vae.state_dict(),
-                "disc_state_dict": discriminator.state_dict(),
-                "vae_optimizer_state_dict": vae_opt.state_dict(),
-                "disc_optimizer_state_dict": disc_opt.state_dict(),
-                "vae_lr_scheduler_state_dict": vae_lr_scheduler.state_dict()
-                if vae_lr_scheduler is not None
-                else None,
-                "disc_lr_scheduler_state_dict": disc_lr_scheduler.state_dict()
-                if disc_lr_scheduler is not None
-                else None,
-                "global_step": global_step,
-                "epoch": epoch,
-                "scaler_state_dict": scaler.state_dict(),
-            }
+        checkpoint_states = {
+            "vae_state_dict": vae.state_dict(),
+            "disc_state_dict": discriminator.state_dict(),
+            "ema_vae_state_dict": ema_vae.state_dict(),
+            "vae_optimizer_state_dict": vae_opt.state_dict(),
+            "disc_optimizer_state_dict": disc_opt.state_dict(),
+            "vae_lr_scheduler_state_dict": vae_lr_scheduler.state_dict()
+            if vae_lr_scheduler is not None
+            else None,
+            "disc_lr_scheduler_state_dict": disc_lr_scheduler.state_dict()
+            if disc_lr_scheduler is not None
+            else None,
+            "global_step": global_step,
+            "epoch": epoch,
+            "scaler_state_dict": scaler.state_dict(),
+        }
 
             torch.save(checkpoint_states, model_checkpoint_path)
 
