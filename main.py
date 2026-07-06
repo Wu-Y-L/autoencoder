@@ -10,17 +10,16 @@ from torchvision import transforms
 from sklearn.model_selection import train_test_split
 import torchinfo
 
-torch.cuda.manual_seed(10)
-torch.manual_seed(10)
+torch.cuda.manual_seed(42)
+torch.manual_seed(42)
 
 # define data path
 DATA_PATH = Path("train_autoencoder")
 transform = None
-NUM_WORKERS = -1
 N_PATCHES = 8
 PATCH_SIZE = 512
-CACHE_SIZE = 10
-BATCH_SIZE = 8
+CACHE_SIZE = 2  # per DataLoader worker now, so keep small to avoid OOM/shm blowups
+BATCH_SIZE = 16
 
 CHANNEL_LIST = [1, 128, 256, 512]
 LATENT_DIMS = 8
@@ -33,7 +32,6 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 vae_dataset = vae_dataset_loader.load_vae_dataset(
     input_dir=DATA_PATH,
     transform=transform,
-    n_jobs=NUM_WORKERS,
     n_patches=N_PATCHES,
     patch_size=PATCH_SIZE,
     cache_size=CACHE_SIZE,
@@ -54,10 +52,22 @@ print("done!")
 
 print("loading data into DataLoader...")
 train_dataloader = torch.utils.data.DataLoader(
-    train_dataset, batch_size=BATCH_SIZE, shuffle=True
+    train_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
 )
 test_dataloader = torch.utils.data.DataLoader(
-    test_dataset, batch_size=BATCH_SIZE, shuffle=False
+    test_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
+    num_workers=2,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2,
 )
 print("Done!")
 
@@ -80,10 +90,10 @@ total_steps = steps_per_epoch * EPOCHS
 
 loss_fn = loss.VAE_loss(
     l1_w=1.0,
-    kl_w=1.0,
-    adv_w=0.5,
-    adv_start_step=int(0.05 * total_steps),
-    adv_ramp_steps=int(0.10 * total_steps),
+    kl_w=1e-03,
+    adv_w=1e-3,
+    adv_start_step=int(0.1 * total_steps),
+    adv_ramp_steps=int(0.15 * total_steps),
 )
 
 vae_opt = torch.optim.AdamW(
@@ -118,7 +128,7 @@ result = train.train_vae(
     epochs=EPOCHS,
     vae_lr_scheduler=None,
     disc_lr_scheduler=None,
-    model_name="VAE_run_1",
+    model_name="VAE_run_5",
     kl_annealing_scheduler=kl_annealing_scheduler,
     device=device,
 )

@@ -46,13 +46,22 @@ def train_step(
 
     total_disc_loss, total_vae_loss = 0.0, 0.0
 
-    for i, X in tqdm(enumerate(train_dataloader)):
+    # bf16 has fp32's exponent range, so activations can't overflow to inf at the
+    # fp16 ceiling (65504) -- which is what was producing NaN recon a few steps in.
+    # Fall back to fp16 only on GPUs without bf16 support.
+    amp_dtype = (
+        torch.bfloat16
+        if device == "cuda" and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
+
+    for i, X in enumerate(train_dataloader):
         vae.train()
         discriminator.train()
 
         X = X.to(device)
 
-        with torch.autocast(device_type=device):
+        with torch.autocast(device_type=device, dtype=amp_dtype):
             reconstruct, mu, log_var = vae(X)
 
         # train discriminator (gated: prevents over-specialization before gen feels adv)
@@ -62,7 +71,7 @@ def train_step(
 
             disc_recon = reconstruct.detach()
 
-            with torch.autocast(device_type=device):
+            with torch.autocast(device_type=device, dtype=amp_dtype):
                 fake_score = discriminator(disc_recon)
                 real_score = discriminator(X)
 
@@ -79,7 +88,7 @@ def train_step(
 
         kl_w = kl_scheduler.get_value(current_step=step)
 
-        with torch.autocast(device_type=device):
+        with torch.autocast(device_type=device, dtype=amp_dtype):
             vae_loss, loss_dict = loss_fn(
                 recon=reconstruct,
                 target=X,
@@ -102,9 +111,9 @@ def train_step(
         if i % 100 == 0:
             print(
                 f"currently at : {i} / {len(train_dataloader)} \n"
-                f"avg_vae_loss : {total_vae_loss / max(i, 1)}"
+                f"avg_vae_loss : {total_vae_loss / max(i, 1)}\n"
                 f"loss_dict : {loss_dict} \n",
-                f"discriminator loss : {total_disc_loss / max(i, 1)}",
+                f"discriminator loss : {total_disc_loss / max(i, 1)}\n",
             )
 
         step += 1
@@ -130,7 +139,7 @@ def test_step(vae, discriminator, test_dataloader, loss_fn, kl_scheduler, step, 
     total_disc_loss, total_vae_loss = 0.0, 0.0
 
     with torch.inference_mode():
-        for i, X in tqdm(enumerate(test_dataloader)):
+        for i, X in enumerate(test_dataloader):
             X = X.to(device)
 
             # get discriminator loss
@@ -202,9 +211,9 @@ def test_step(vae, discriminator, test_dataloader, loss_fn, kl_scheduler, step, 
             if i % 100 == 0:
                 print(
                     f"test step currently at : {i} / {len(test_dataloader)} \n"
-                    f"avg_vae_loss : {total_vae_loss / max(i, 1)}"
+                    f"avg_vae_loss : {total_vae_loss / max(i, 1)}\n"
                     f"loss_dict : {loss_dict} \n",
-                    f"discriminator loss : {total_disc_loss / max(i, 1)}",
+                    f"discriminator loss : {total_disc_loss / max(i, 1)}\n",
                 )
 
     return total_vae_loss / len(test_dataloader), total_disc_loss / len(test_dataloader)
@@ -393,22 +402,22 @@ def train_vae(
 
             # checkpointing
 
-        checkpoint_states = {
-            "vae_state_dict": vae.state_dict(),
-            "disc_state_dict": discriminator.state_dict(),
-            "ema_vae_state_dict": ema_vae.state_dict(),
-            "vae_optimizer_state_dict": vae_opt.state_dict(),
-            "disc_optimizer_state_dict": disc_opt.state_dict(),
-            "vae_lr_scheduler_state_dict": vae_lr_scheduler.state_dict()
-            if vae_lr_scheduler is not None
-            else None,
-            "disc_lr_scheduler_state_dict": disc_lr_scheduler.state_dict()
-            if disc_lr_scheduler is not None
-            else None,
-            "global_step": global_step,
-            "epoch": epoch,
-            "scaler_state_dict": scaler.state_dict(),
-        }
+            checkpoint_states = {
+                "vae_state_dict": vae.state_dict(),
+                "disc_state_dict": discriminator.state_dict(),
+                "ema_vae_state_dict": ema_vae.state_dict(),
+                "vae_optimizer_state_dict": vae_opt.state_dict(),
+                "disc_optimizer_state_dict": disc_opt.state_dict(),
+                "vae_lr_scheduler_state_dict": vae_lr_scheduler.state_dict()
+                if vae_lr_scheduler is not None
+                else None,
+                "disc_lr_scheduler_state_dict": disc_lr_scheduler.state_dict()
+                if disc_lr_scheduler is not None
+                else None,
+                "global_step": global_step,
+                "epoch": epoch,
+                "scaler_state_dict": scaler.state_dict(),
+            }
 
             torch.save(checkpoint_states, model_checkpoint_path)
 
@@ -422,6 +431,260 @@ def train_vae(
                     torch.save(
                         checkpoint_states,
                         f"{save_model_path}/{model_name}_epoch_{epoch}_vae_test_loss_{test_vae_loss:.2f}.pt",
+                    )
+
+            with open(result_checkpoint, "wb") as f:
+                pypickle.dump(results, f)
+                print("saved results")
+
+            bar()
+
+    return results
+
+
+def compute_latent_stats(vae, dataloader, device, latent_dim=8):
+    """One-time pass. Returns per-channel (mean, std) of the GT latents, each shape [latent_dim]."""
+    vae.eval()
+    # accumulate in float64 for precision; reduce over batch + spatial, keep the CHANNEL dim
+    ch_sum   = torch.zeros(latent_dim, dtype=torch.float64, device=device)
+    ch_sumsq = torch.zeros(latent_dim, dtype=torch.float64, device=device)
+    count = 0
+
+    with torch.no_grad():
+        for _inp, gt in dataloader:
+            mu, log_var = vae.encode(gt.to(device))
+            ch_sum += mu.sum(dim=(0,2,3)).double()
+            ch_sumsq += (mu ** 2 ).sum(dim = (0,2,3)).double()
+            count += mu.shape[0] * mu.shape[2] * mu.shape[3]
+
+    mean = ch_sum / count
+    var  = ch_sumsq / count - mean**2
+    std  = var.clamp_min(1e-12).sqrt()
+    return mean.float(), std.float()
+
+
+def normalize_latent(z, mean, std):        # z:[B,C,H,W], mean/std:[C]
+    return (z - mean[None, :, None, None]) / std[None, :, None, None]
+
+
+def denormalize_latent(z_tilde, mean, std):  # inverse, for decoding samples later
+    return z_tilde * std[None, :, None, None] + mean[None, :, None, None]
+
+
+def latent_train_step(model, vae, diffusion, dataloader, optimizer, loss_fn,
+                      mean, std, device, noise_steps):
+    model.train()
+    vae.eval()
+    mean, std = mean.to(device), std.to(device)
+    running = 0.0
+    for i, data in enumerate(dataloader):
+        
+        inp, gt = data
+
+        inp, gt = inp.to(device), gt.to(device)
+        
+        with torch.no_grad():
+            mu_cond, _ = vae.encode(inp)
+            mu_gt, log_var_gt = vae.encode(gt)
+            z_gt = vae.reparameterization(mu_gt, log_var_gt)
+        
+        # normalize latent space
+        z_cond = normalize_latent(mu_cond, mean, std)
+        
+        z_target = normalize_latent(z_gt, mean, std)
+
+        # prepare latent data 
+        t = torch.randint(0, noise_steps, (z_target.shape[0],), device = device)
+        x_t, noise = diffusion.forward_diffusion(z_target, t)
+        model_in = torch.cat([z_cond, x_t], dim = 1)
+        
+        preds = model(model_in, t)
+        
+        loss = loss_fn(preds, noise)
+        
+        optimizer.zero_grad()
+
+        loss.backward()
+
+        optimizer.step()
+
+        running += loss.cpu().item()
+
+        if i % 100 == 0:
+            print(
+                f"currently at : {i} / {len(dataloader)} \n"
+                f"avg_train_loss : {running / max(i, 1)}\n"
+            )
+
+    return running / len(dataloader)
+
+def latent_test_step(model, vae, diffusion, dataloader, loss_fn, mean, std, device, noise_steps):
+    model.eval() ; vae.eval() 
+
+    mean, std = mean.to(device), std.to(device)
+
+    running = 0.0 
+    with torch.inference_mode():
+        for i, data in enumerate(dataloader):
+            X, y = data 
+
+            X, y = X.to(device), y.to(device)
+
+            mu_cond, _ = vae.encode(X)
+            mu_target, log_var_gt = vae.encode(y)
+            z_target = vae.reparameterization(mu_target, log_var_gt)
+
+            # normalize latent space
+            z_cond = normalize_latent(mu_cond, mean, std)
+            
+            z_target = normalize_latent(z_target, mean, std)
+
+            t = torch.randint(0, noise_steps, (z_target.shape[0],), device = device)
+            x_t, noise = diffusion.forward_diffusion(z_target, t)
+            model_in = torch.cat([z_cond, x_t], dim = 1)
+            
+            preds = model(model_in, t)
+            
+            loss = loss_fn(preds, noise)
+
+            runing += loss.cpu().item()
+
+            if i % 100 == 0:
+                print(
+                f"currently at : {i} / {len(dataloader)} \n"
+                f"avg_test_loss : {running / max(i, 1)}\n"
+            ) 
+    
+    return running / len(dataloader)
+
+def train_vae(
+    model,
+    vae,
+    optimizer,
+    loss_fn,
+    train_dataloader,
+    test_dataloader,
+    scheduler,
+    epochs,
+    mean,
+    std,
+    noise_steps,
+    diffusion,
+    model_name,
+    device,
+):
+
+    # implement caching here
+    checkpoint_dir = Path("model_checkpoint")
+    if not checkpoint_dir.exists():
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    result_checkpoint = checkpoint_dir / f"{model_name}_results_checkpoint.pkl"
+
+    if result_checkpoint.is_file():
+        with open(result_checkpoint, "rb") as rc:
+            print("found results checkpoint, continuing")
+            results = pypickle.load(rc)
+    else:
+        print("no checkpoint found, initializing empty results dictionary")
+        results = {
+            "train_loss": [],
+            "test_loss" : []
+        }
+
+    model_checkpoint_path = checkpoint_dir / f"{model_name}_latest_epoch.pt"
+
+    if model_checkpoint_path.exists():
+        print("model checkpoint found, continuing from last saved statedict")
+        checkpoint_states = torch.load(model_checkpoint_path, map_location=device)
+
+        model.load_state_dict(checkpoint_states["model_state_dict"])
+        optimizer.load_state_dict(checkpoint_states["optimizer_state_dict"])
+
+        if scheduler:
+            scheduler.load_state_dict(checkpoint_states["scheduler_state_dict"])
+
+        checkpoint_epoch = checkpoint_states["epoch"] + 1
+
+    else:
+        print("no checkpoint found, starting training ")
+        checkpoint_epoch = 0
+
+    # compute mean and std and store 
+
+
+    # training loop
+    with alive_bar(epochs - checkpoint_epoch, bar="fish") as bar:
+        for epoch in range(checkpoint_epoch, epochs):
+            train_loss = latent_train_step(
+                model = model,
+                vae=vae,
+                optimizer = optimizer,
+                loss_fn=loss_fn,
+                dataloader=train_dataloader,
+                mean = mean,
+                std = std,
+                noise_steps = noise_steps,
+                diffusion = diffusion,
+                device=device,
+            )
+
+            # generate a few preview images on test set
+            # INFERENCE NEEDS TO BE REWRITTEN
+            
+
+            test_loss = latent_test_step(
+                model = model, 
+                vae = vae, 
+                diffusion = diffusion,
+                loss_fn = loss_fn,
+                dataloader = test_dataloader,
+                mean = mean,
+                std = std,
+                noise_steps = noise_steps,
+                device = device
+            )
+
+            print(
+                f"epoch         : {epoch} ------------------------------------------\n",
+                f"train loss: {train_loss}\n",
+                f"------------------------------------------------------------------\n",
+                f"test loss : {test_loss}\n",
+            )
+
+            results["train_loss"].append(train_loss)
+            results["test_loss"].append(test_loss)
+
+
+            # scheduler step
+
+            if scheduler:
+                scheduler.step()
+
+            # checkpointing
+
+            checkpoint_states = {
+                "model_state_dict"    : model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict()
+                if scheduler is not None
+                else None,
+                "epoch": epoch,
+
+            }
+
+            torch.save(checkpoint_states, model_checkpoint_path)
+
+            if epoch >= 10:
+                save_model_path = checkpoint_dir / "best_models" / model_name
+
+                if not save_model_path.exists():
+                    save_model_path.mkdir(parents=True, exist_ok=True)
+
+                if min(results["test_loss"]) == test_loss:
+                    torch.save(
+                        checkpoint_states,
+                        f"{save_model_path}/{model_name}_epoch_{epoch}_vae_test_loss_{test_loss:.2f}.pt",
                     )
 
             with open(result_checkpoint, "wb") as f:

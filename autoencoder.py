@@ -328,6 +328,12 @@ class VAE(nn.Module):
         mu = self.conv_mu(x)
         log_var = self.conv_log_var(x)
 
+        # clamp log_var so exp() can never overflow. Without this bound log_var
+        # is free to drift (KL weight is annealed to 0 early in training), and
+        # once it passes ~22 exp() overflows to inf/NaN under autocast, which
+        # then flows std -> z -> decoder -> recon = NaN and corrupts all weights.
+        log_var = torch.clamp(log_var, min=-30.0, max=20.0)
+
         return mu, log_var
 
     def reparameterization(self, mu, log_var):
