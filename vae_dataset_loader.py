@@ -159,13 +159,12 @@ def _append_files_with_gt(path, tif: bool = True):
 class ConditionalPatchDataset(torch.utils.data.Dataset):
     """Yields (input_patch, gt_patch), each [1, 512, 512] in [0,1] (VAE domain).
        Stack layout: [input_0, ..., input_{n-1}, GT]  -- last slice is ground truth."""
-    def __init__(self, data_dir, patch_size=512, n_patches=8, transform=None, cache_size=2, device : str = "cuda" if torch.cuda.is_available() else "cpu"):
+    def __init__(self, data_dir, patch_size=512, n_patches=8, transform=None, cache_size=2):
         self.data_dir = data_dir
         self.patch_size = patch_size
         self.transform = transform
         self.cache = OrderedDict(); self.cache_size = cache_size
         self.samples = []
-        self.device = device 
         # build index sequentially (NO joblib): for each tif, register every NON-GT slice
         #   for path in sorted(data_dir.glob("*/*.tif")):
         #       n_slices = <read metadata only, like vae_dataset_loader._append_files>

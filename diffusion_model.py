@@ -1,7 +1,7 @@
-from rich import padding
 import torch
 from tqdm import tqdm
 from torch import nn 
+import train 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -36,6 +36,8 @@ class diffusion:
         beta_end: float = 0.2,
         image_size=(128, 128), # redefine image_size as a tuple 
         device=device,
+        schedule_type = "cosine",
+        cosine_s = 0.008
     ):
         """initialize diffusion model"""
         self.noise_steps = noise_steps
@@ -43,19 +45,36 @@ class diffusion:
         self.beta_end = beta_end
         self.device = device
 
-        self.beta = self.prepare_noise_schedule().to(device)
+        self.cosine_s = cosine_s
+
+        self.beta = self.prepare_noise_schedule(schedule_type).to(device)
         self.alpha = 1.0 - self.beta
         self.alpha_bar = torch.cumprod(self.alpha, dim=0)
 
         self.image_size = image_size
 
-    def prepare_noise_schedule(self):
+    def prepare_noise_schedule(self, schedule_type):
         """creates noise schedule
         creates an 1000 steps of evenly spaced range of beta
         """
-        return torch.linspace(
-            start=self.beta_start, end=self.beta_end, steps=self.noise_steps
-        )
+        if schedule_type == "cosine":
+
+            x = torch.linspace(0, self.noise_steps, steps = self.noise_steps+1, device = self.device)
+
+            alpha_bar = torch.cos(
+                ((x / self.noise_steps) + self.cosine_s) / (1 + self.cosine_s) * torch.pi * 0.5
+            ) ** 2
+
+            alpha_bar = alpha_bar / alpha_bar[0]
+
+            betas = 1 - (alpha_bar[1:] / alpha_bar[:-1])
+
+            return torch.clamp(betas, min = 1e-8, max = self.beta_end)
+
+        else:
+            return torch.linspace(
+                start=self.beta_start, end=self.beta_end, steps=self.noise_steps, device = self.device
+            )
 
     def forward_diffusion(self, x0, t):
         # add noise using fast forward diffusion algorithm
@@ -191,36 +210,72 @@ class diffusion:
 
     def sample_latent_ddim(model, vae, diffusion, cond_images, mean, std, device,
                        ddim_steps=25, eta=0.0, latent_dim=8):
+        """cond_images: [B,1,512,512] low-SNR inputs -> returns restored [B,1,512,512] in [0,1]."""
 
-      """cond_images: [B,1,512,512] low-SNR inputs -> returns restored [B,1,512,512] in [0,1]."""
-        model.eval(); vae.eval()
-        mean, std = mean.to(device), std.to(device)
-        cond_images = cond_images.to(device)
-        # 1. encode + normalize the conditioning ONCE (fixed across all steps)
-        # mu_cond, _ = vae.encode(cond_images)
-        # z_cond = normalize_latent(mu_cond, mean, std)          # [B, 8, 64, 64]
-        # 2. start the target latent from pure noise
-        # B, _, hL, wL = z_cond.shape
-        # x = torch.randn(B, latent_dim, hL, wL, device=device)
-        # 3. DDIM reverse loop over a sub-sampled schedule
-        time_steps = torch.linspace(0, diffusion.noise_steps - 1, ddim_steps).long()
-        for i in reversed(range(len(time_steps))):
-            t      = time_steps[i]
-            t_prev = time_steps[i-1] if i > 0 else torch.tensor(0)
-            # t_batch = torch.full((B,), int(t), device=device, dtype=torch.long)
-            # pred_noise = model(torch.cat([z_cond, x], dim=1), t_batch)   # <-- concat cond each step -> 16ch
-            # ab, ab_prev = diffusion.alpha_bar[t], diffusion.alpha_bar[t_prev]
-            # x0 = (x - torch.sqrt(1-ab)*pred_noise) / torch.sqrt(ab)
-            # ---- see GOTCHA below about clamping x0 ----
-            # sigma = eta * torch.sqrt((1-ab_prev)/(1-ab)) * torch.sqrt(1 - ab/ab_prev)
-            # noise = torch.randn_like(x) if i > 0 else torch.zeros_like(x)
-            # x = torch.sqrt(ab_prev)*x0 + torch.sqrt(1-ab_prev-sigma**2)*pred_noise + sigma*noise
-            ...
-        # 4. denormalize the final latent, then decode with the (EMA) VAE
-        # z0 = denormalize_latent(x, mean, std)
-        # return vae.decode(z0)      # [B,1,512,512] in [0,1]
-        ...
+        model.eval() 
+        vae.eval() 
 
+        with torch.inference_mode():
+
+            mean, std = mean.to(device), std.to(device)
+
+            cond_images = cond_images.to(device)
+
+            # 1. encode + normalize the conditioning ONCE (fixed across all steps)
+            # mu_cond, _ = vae.encode(cond_images)
+            # z_cond = normalize_latent(mu_cond, mean, std)          # [B, 8, 64, 64]
+            # 2. start the target latent from pure noise
+            # B, _, hL, wL = z_cond.shape
+            # x = torch.randn(B, latent_dim, hL, wL, device=device)
+            # 3. DDIM reverse loop over a sub-sampled schedule
+        
+            mu_cond, _ = vae.encode(cond_images)
+            z_cond = train.normalize_latent(mu_cond, mean, std)
+
+            B, _, hL, wL = z_cond.shape 
+            
+            x = torch.randn(B, latent_dim, hL, wL, device = device)
+
+
+            time_steps = torch.linspace(0, diffusion.noise_steps - 1, ddim_steps, device = device).long()
+            for i in tqdm(
+                reversed(range(len(time_steps))), desc = "Latent space sampling", total = len(time_steps), ):
+                t      = time_steps[i]
+                t_prev = time_steps[i-1] if i > 0 else torch.tensor(0, device = device, dtype = torch.long)
+                # t_batch = torch.full((B,), int(t), device=device, dtype=torch.long)
+                # pred_noise = model(torch.cat([z_cond, x], dim=1), t_batch)   # <-- concat cond each step -> 16ch
+                # ab, ab_prev = diffusion.alpha_bar[t], diffusion.alpha_bar[t_prev]
+                # x0 = (x - torch.sqrt(1-ab)*pred_noise) / torch.sqrt(ab)
+                # ---- see GOTCHA below about clamping x0 ----
+                # sigma = eta * torch.sqrt((1-ab_prev)/(1-ab)) * torch.sqrt(1 - ab/ab_prev)
+                # noise = torch.randn_like(x) if i > 0 else torch.zeros_like(x)
+                # x = torch.sqrt(ab_prev)*x0 + torch.sqrt(1-ab_prev-sigma**2)*pred_noise + sigma*noise
+                
+                alpha_bar = diffusion.alpha_bar
+
+                alpha_bar = alpha_bar.to(device)
+
+                t_batch = torch.full((B,), int(t.item()), device = device, dtype = torch.long )
+                pred_noise = model(torch.cat([z_cond, x], dim = 1), t_batch) 
+                ab, ab_prev = alpha_bar[t], alpha_bar[t_prev]
+                x0 = (x - torch.sqrt(1-ab) * pred_noise) / torch.sqrt(ab)
+
+                sigma = eta * torch.sqrt((1 - ab_prev) / (1 - ab)) * torch.sqrt(1 - ab / ab_prev)
+
+                noise = torch.randn_like(x) if i > 0 else torch.zeros_like(x)
+                
+                x =(  torch.sqrt(ab_prev) * x0 
+                    + torch.sqrt(1 - ab_prev - sigma ** 2) * pred_noise 
+                    + sigma * noise )
+
+            # 4. denormalize the final latent, then decode with the (EMA) VAE
+            # z0 = denormalize_latent(x, mean, std)
+            # return vae.decode(z0)      # [B,1,512,512] in [0,1]
+            z0 = train.denormalize_latent(x, mean, std) 
+
+            restored = vae.decode(z0)
+
+            return restored.clamp(0.0, 1.0)
 # create time embedding 
 
 class TimeEmbedding(nn.Module):

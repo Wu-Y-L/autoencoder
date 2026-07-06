@@ -576,7 +576,8 @@ def train_diffusion(
     diffusion,
     model_name,
     device,
-    ema_decay = 0.999 
+    ema_decay = 0.999,
+    latent_dims = 8 , 
 ):
 
     # implement caching here
@@ -645,10 +646,62 @@ def train_diffusion(
                 ema_model = ema_model,
                 decay = ema_decay
             )
-
-            # generate a few preview images on test set
-            # INFERENCE NEEDS TO BE REWRITTEN
             
+            # generate preview images 
+            with torch.inference_mode():
+                plt.figure(figsize=(16, 12))
+
+                ema_model.eval() ; vae.eval()
+                X, y = next(iter(test_dataloader))
+
+                X, y = X.to(device), y.to(device)
+
+
+                generated_img = diffusion.sample_latent_ddim(
+                    model = ema_model,
+                    vae = vae,
+                    diffusion = diffusion, 
+                    cond_images=X,
+                    mean=mean,
+                    std=std,
+                    device=device,
+                    ddim_steps=25,
+                    eta=0.0,
+                    latent_dim=latent_dims,
+                )
+
+                for i in range(4):
+                    orig = X[i].detach.cpu().permute(1, 2, 0).squeeze()
+                    recon = generated_img[i].detach.cpu().permute(1, 2, 0).squeeze()
+                    target = y[i].detach.cpu().permute(1, 2, 0).squeeze()
+
+                    plt.subplot(4, 3, i * 3 + 2)
+                    plt.imshow(recon)
+                    plt.title("LDM reconstruction")
+                    plt.axis("off")
+
+                    plt.subplot(4, 3, i * 3 + 1)
+                    plt.imshow(orig)
+                    plt.title("input img")
+                    plt.axis("off")
+
+                    plt.subplot(4, 3, i * 3 + 3)
+                    plt.imshow(target)
+                    plt.title("Target")
+                    plt.axis("off")
+
+                # plt.show(block=False)
+                # plt.pause(10)
+                # plt.close("all")
+
+                preview_dir = checkpoint_dir / "previews"
+
+                if not preview_dir.exists():
+                    preview_dir.mkdir(parents=True, exist_ok=True)
+
+                plt.tight_layout()
+                plt.savefig(preview_dir / f"{model_name}_epoch_{epoch}.png", dpi=150)
+                plt.close("all")
 
             test_loss = latent_test_step(
                 model = model, 
@@ -688,7 +741,6 @@ def train_diffusion(
                 if scheduler is not None
                 else None,
                 "epoch": epoch,
-
             }
 
             torch.save(checkpoint_states, model_checkpoint_path)
@@ -702,7 +754,7 @@ def train_diffusion(
                 if min(results["test_loss"]) == test_loss:
                     torch.save(
                         checkpoint_states,
-                        f"{save_model_path}/{model_name}_epoch_{epoch}_vae_test_loss_{test_loss:.2f}.pt",
+                        f"{save_model_path}/{model_name}_epoch_{epoch}_LDM_test_loss_{test_loss:.2f}.pt",
                     )
 
             with open(result_checkpoint, "wb") as f:
