@@ -1,3 +1,4 @@
+from rich import padding
 import torch
 from tqdm import tqdm
 from torch import nn 
@@ -186,6 +187,39 @@ class diffusion:
             denoised_image = denoised_image.swapaxes(0, 1)
 
             return denoised_image
+
+
+    def sample_latent_ddim(model, vae, diffusion, cond_images, mean, std, device,
+                       ddim_steps=25, eta=0.0, latent_dim=8):
+
+      """cond_images: [B,1,512,512] low-SNR inputs -> returns restored [B,1,512,512] in [0,1]."""
+        model.eval(); vae.eval()
+        mean, std = mean.to(device), std.to(device)
+        cond_images = cond_images.to(device)
+        # 1. encode + normalize the conditioning ONCE (fixed across all steps)
+        # mu_cond, _ = vae.encode(cond_images)
+        # z_cond = normalize_latent(mu_cond, mean, std)          # [B, 8, 64, 64]
+        # 2. start the target latent from pure noise
+        # B, _, hL, wL = z_cond.shape
+        # x = torch.randn(B, latent_dim, hL, wL, device=device)
+        # 3. DDIM reverse loop over a sub-sampled schedule
+        time_steps = torch.linspace(0, diffusion.noise_steps - 1, ddim_steps).long()
+        for i in reversed(range(len(time_steps))):
+            t      = time_steps[i]
+            t_prev = time_steps[i-1] if i > 0 else torch.tensor(0)
+            # t_batch = torch.full((B,), int(t), device=device, dtype=torch.long)
+            # pred_noise = model(torch.cat([z_cond, x], dim=1), t_batch)   # <-- concat cond each step -> 16ch
+            # ab, ab_prev = diffusion.alpha_bar[t], diffusion.alpha_bar[t_prev]
+            # x0 = (x - torch.sqrt(1-ab)*pred_noise) / torch.sqrt(ab)
+            # ---- see GOTCHA below about clamping x0 ----
+            # sigma = eta * torch.sqrt((1-ab_prev)/(1-ab)) * torch.sqrt(1 - ab/ab_prev)
+            # noise = torch.randn_like(x) if i > 0 else torch.zeros_like(x)
+            # x = torch.sqrt(ab_prev)*x0 + torch.sqrt(1-ab_prev-sigma**2)*pred_noise + sigma*noise
+            ...
+        # 4. denormalize the final latent, then decode with the (EMA) VAE
+        # z0 = denormalize_latent(x, mean, std)
+        # return vae.decode(z0)      # [B,1,512,512] in [0,1]
+        ...
 
 # create time embedding 
 
@@ -491,3 +525,4 @@ class DiffusionUNet(nn.Module):
             h = self.up_levels[i](h, t_emb)
 
         return self.conv_out(h) # final conv
+

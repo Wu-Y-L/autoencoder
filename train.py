@@ -472,7 +472,7 @@ def denormalize_latent(z_tilde, mean, std):  # inverse, for decoding samples lat
 
 
 def latent_train_step(model, vae, diffusion, dataloader, optimizer, loss_fn,
-                      mean, std, device, noise_steps):
+                      mean, std, device, noise_steps, ema_model, decay):
     model.train()
     vae.eval()
     mean, std = mean.to(device), std.to(device)
@@ -507,6 +507,10 @@ def latent_train_step(model, vae, diffusion, dataloader, optimizer, loss_fn,
         loss.backward()
 
         optimizer.step()
+
+        for ep, p in zip(ema_model.parameters(), model.parameters()): 
+            ep.mul_(decay).add_(p, alpha=1-decay)
+
 
         running += loss.cpu().item()
 
@@ -547,7 +551,7 @@ def latent_test_step(model, vae, diffusion, dataloader, loss_fn, mean, std, devi
             
             loss = loss_fn(preds, noise)
 
-            runing += loss.cpu().item()
+            running += loss.cpu().item()
 
             if i % 100 == 0:
                 print(
@@ -557,7 +561,7 @@ def latent_test_step(model, vae, diffusion, dataloader, loss_fn, mean, std, devi
     
     return running / len(dataloader)
 
-def train_vae(
+def train_diffusion(
     model,
     vae,
     optimizer,
@@ -572,6 +576,7 @@ def train_vae(
     diffusion,
     model_name,
     device,
+    ema_decay = 0.999 
 ):
 
     # implement caching here
@@ -599,6 +604,7 @@ def train_vae(
         checkpoint_states = torch.load(model_checkpoint_path, map_location=device)
 
         model.load_state_dict(checkpoint_states["model_state_dict"])
+
         optimizer.load_state_dict(checkpoint_states["optimizer_state_dict"])
 
         if scheduler:
@@ -610,8 +616,17 @@ def train_vae(
         print("no checkpoint found, starting training ")
         checkpoint_epoch = 0
 
-    # compute mean and std and store 
 
+    ema_model = copy.deepcopy(vae)
+    ema_model.eval()
+    for p in ema_model.parameters():
+        p.requires_grad_(False)
+
+    if (
+        model_checkpoint_path.exists()
+        and checkpoint_states.get("ema_vae_state_dict") is not None
+    ):
+        ema_model.load_state_dict(checkpoint_states["ema_model_state_dict"])
 
     # training loop
     with alive_bar(epochs - checkpoint_epoch, bar="fish") as bar:
@@ -627,6 +642,8 @@ def train_vae(
                 noise_steps = noise_steps,
                 diffusion = diffusion,
                 device=device,
+                ema_model = ema_model,
+                decay = ema_decay
             )
 
             # generate a few preview images on test set
@@ -666,6 +683,7 @@ def train_vae(
             checkpoint_states = {
                 "model_state_dict"    : model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "ema_model_state_dict": ema_model.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict()
                 if scheduler is not None
                 else None,
